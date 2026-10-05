@@ -2,7 +2,7 @@
 
 from .nodes import AnimaDecoupledConditioning
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 NODE_CLASS_MAPPINGS = {
     "AnimaDecoupledConditioning": AnimaDecoupledConditioning,

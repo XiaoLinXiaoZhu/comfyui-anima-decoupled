@@ -1,27 +1,25 @@
 # ComfyUI Anima Decoupled Conditioning
 
-A single-node ComfyUI extension that feeds **two different texts** to the two text
-towers that Anima actually uses: the **Qwen3-0.6B source encoder** and the **T5
-target tokenizer**.
+This extension provides the `Anima Decoupled Conditioning` node. It splits Anima's
+two text towers — the **Qwen3-0.6B source encoder** and the **T5 target tokenizer** —
+so each can receive its own text, which lets the model make better use of your prompt.
 
 [中文说明](README.zh-CN.md) · [Usage guide](docs/usage.md) · [Mechanism notes](docs/mechanism.md)
 
----
+## The node
 
-## What it does
+Use it exactly like a positive `CLIPTextEncode`: connect the Anima checkpoint's CLIP
+output to `clip`, connect `conditioning` to the sampler's positive input, and leave the
+negative path as it is.
 
-Upstream Anima tokenizes **one** text twice and hands both results to the same
-conditioning path. This node breaks that link:
-
-| Input | Goes to | Effect |
-|---|---|---|
-| `qwen_input` | Qwen3-0.6B source encoder | contextualizes the conditioning |
-| `t5_input` | T5 target side | **decides how many conditioning rows exist and what each row is anchored to** |
-| `qwen_prefix` | prepended to `qwen_input` on the Qwen side only | shapes the source hidden states |
-| `strip_prefix` | — | when on (default), removes the prefix's own rows so it never becomes a conditioning row |
-
-It is pure mechanism: no XML parsing, no tag cleanup, no format validation. You
-decide what each side receives.
+| | Name | Type | Default | Description |
+|---|---|---|---|---|
+| in | `clip` | CLIP | — | CLIP output of an Anima checkpoint (required; it provides the Qwen + T5 tokenizers). |
+| in | `qwen_input` | STRING | `""` | Body of the text handed to Qwen3-0.6B. |
+| in | `t5_input` | STRING | `""` | Text handed to T5; **decides the conditioning row count and each row's token anchor**. |
+| in | `qwen_prefix` | STRING | `""` | Prepended to `qwen_input` on the Qwen side only, with exactly one space. |
+| in | `strip_prefix` | BOOLEAN | `true` | Whether to cut the prefix's own rows from the source hidden states. |
+| out | `conditioning` | CONDITIONING | — | Upstream `Anima.extra_conds` runs the adapter and zero-pads to 512 rows. |
 
 ```mermaid
 flowchart LR
@@ -29,9 +27,119 @@ flowchart LR
     T["t5_input"] --> E2["T5 tokenizer"]
     E1 --> AD["LLM Adapter<br/>(rows anchored to T5 token ids)"]
     E2 --> AD
-    AD --> C["512 x 1024 conditioning<br/>(zero padded)"]
+    AD --> C["512 x 1024 conditioning (zero padded)"]
     C --> D["Anima DiT cross-attention"]
 ```
+
+## Use cases
+
+### 1. Repeat the prompt — `PP【P】`
+
+Start here. It takes almost no change to an existing workflow: copy your prompt twice
+into `qwen_prefix` and leave every connection and parameter as it was.
+
+Notation: `P` is your prompt; `PP【P】` means "encode `P` three times, keep only the
+third copy as conditioning rows".
+
+```
+qwen_prefix  = P P      <- two copies, stripped away
+qwen_input   = P        <- the copy that survives
+t5_input     = <your usual prompt>
+strip_prefix = true
+```
+
+The node joins them into `P P P`, encodes that once, and cuts the first two copies'
+rows by token-level longest common prefix. Qwen attention is causal, so the surviving
+third copy has seen the first two (measured backflow 0.118; the first copy is exactly
+0), which gives the small model a roughly bidirectional view — while the **conditioning
+row count stays identical to a single pass** and the T5 side is untouched.
+
+Gains fall off quickly: the third copy already reaches ~86–92% of the sixth copy's
+effect, and the second copy gets more than half. Three copies is the recommended start.
+
+Do not put the three copies directly into `qwen_input`: the un-contextualized first copy
+then stays among the adapter's keys, and the measured shift is only about a third of
+this recipe's, mixed with a nearly orthogonal key-duplication effect. See
+[mechanism notes](docs/mechanism.md).
+
+> **Two measured caveats**
+>
+> - **It changes the art style.** A different source shifts the overall direction of the
+>   conditioning, so artist/style mixing can differ from what you get without it. Compare
+>   at a fixed seed before switching.
+> - **Natural language shows more than pure tags.** When `t5_input` is a pure tag string,
+>   the Qwen channel has little leverage on the final conditioning (measured at roughly
+>   the 9% level for a pure-tag target), so the repeated source may barely show. It is
+>   worth trying when the source is natural-language description.
+
+### 2. Standard tags on T5, natural-language scene description on Qwen
+
+The row count comes from the T5 tokenization, and row content is what the DiT actually
+reads. Putting structure, relationships and narrative on the Qwen side attaches nearly
+unlimited context capacity through a channel that **costs no conditioning rows**.
+
+A reproducible example (`qwen_prefix` empty, `strip_prefix` left on; only the other two
+fields change):
+
+```
+qwen_input = A courier leans on a rusted railing above a flooded street; neon signs
+             behind her reflect in the puddles. Rain streaks across the lens and the
+             background falls out of focus behind her left shoulder.
+t5_input   = 1girl, solo, courier jacket, rain, puddle, neon sign, railing, night,
+             from side, shallow depth of field, (backlight:1.2)
+```
+
+- Write what you want drawn into `t5_input`, as complete phrases: the DiT's
+  cross-attention has no mask and no RoPE, so conditioning rows are an unordered set and
+  binding can only ride on the row content itself.
+- Put prose, structure markers and comments on the Qwen side. In testing, meta-text
+  (for example a literal `@handle`) placed in the target side was rendered as visible
+  text in the image.
+- This channel has less leverage than the T5 side: it is good for disambiguation and
+  steering, not for overriding what `t5_input` says.
+
+## How it works
+
+### Why the split is possible
+
+Upstream `AnimaTokenizer` just tokenizes **one** text twice (Qwen vocabulary and T5
+vocabulary) and sends both into the same conditioning path; nothing in the code requires
+the two to come from the same text:
+
+- `LLMAdapter(source_hidden_states, target_input_ids)` takes two independent inputs, and
+  the row count is decided entirely by the target (T5) side;
+- the adapter aligns the Qwen hidden states into the T5 conditioning space. It is a
+  separate component, completed before DiT training, and the DiT only consumes the
+  adapter's output without caring where either side came from — so changing the source
+  text needs no DiT change;
+- the node therefore only produces two things: source hidden states in `cross_attn`, and
+  the target side's `t5xxl_ids` / `t5xxl_weights`. Upstream `Anima.extra_conds` runs the
+  adapter and zero-pads to 512 rows.
+
+### Why repetition helps
+
+Qwen3-0.6B is a small causal model: in a single pass over `A B C`, `A` cannot see `B` or
+`C`. Encoded as `A1 B1 C1 A2 B2 C2`, every token of the second copy can attend to the
+first copy — later content flows back into earlier positions. Measured: changing only the
+last tag from `flower` to `sword` moves the shared-prefix hidden states of the second
+copy by 0.118, while the two different edits produce directions with cosine 0.27 — the
+backflow carries specific content, not a generic "some preceding text exists" drift.
+Keeping only the last copy as conditioning rows yields a roughly bidirectional view at
+an unchanged row count.
+
+### What `strip_prefix` does
+
+1. `source_text = qwen_prefix.strip() + " " + qwen_input.lstrip()` (the body alone when
+   the prefix is empty).
+2. `source_text` and the prefix are tokenized separately with the Qwen tokenizer.
+3. The dropped row count is the **measured** longest common prefix of the two token-id
+   sequences — not `len(tokenize(prefix))`, because whitespace merging at the join point
+   can shift the count by one.
+4. Those leading rows are sliced off (`cond[:, dropped:]`) before the adapter runs: the
+   prefix still influences later rows through attention without occupying a row itself.
+
+If the prefix shares no token prefix with the joined text, the node raises instead of
+silently keeping prefix rows.
 
 ## Installation
 
@@ -46,7 +154,7 @@ Then restart ComfyUI.
 
 ### Option 2 — ComfyUI Manager
 
-In ComfyUI Manager choose **Install via Git URL** and paste:
+Choose **Install via Git URL** and paste:
 
 ```
 https://github.com/XiaoLinXiaoZhu/comfyui-anima-decoupled.git
@@ -54,115 +162,12 @@ https://github.com/XiaoLinXiaoZhu/comfyui-anima-decoupled.git
 
 No Python dependencies beyond what ComfyUI already ships (`torch`).
 
-## Quick start
-
-1. Add the **Anima Decoupled Conditioning** node (category `conditioning`).
-2. Connect your Anima checkpoint's `CLIP` output to `clip`.
-3. Wire the node's `conditioning` output into the positive input of your sampler,
-   exactly where a `CLIPTextEncode` used to be.
-4. Fill `qwen_input`, `t5_input` and (optionally) `qwen_prefix`.
-
-A common first setup — a structured description for Qwen, a clean tag string for
-T5:
-
-```
-qwen_input = A girl stands on a rooftop at sunset, her coat open in the wind.
-             Warm rim light, telephoto compression, shallow depth of field.
-t5_input   = 1girl, solo, rooftop, sunset, coat, wind, rim light, telephoto
-qwen_prefix = (empty)
-strip_prefix = true
-```
-
-## Node reference
-
-| Input | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `clip` | CLIP | yes | — | CLIP output of an Anima checkpoint (it must use Anima's dual tokenizer). |
-| `qwen_input` | STRING (multiline) | yes | `""` | Body of the text encoded by Qwen3-0.6B. |
-| `t5_input` | STRING (multiline) | yes | `""` | Text tokenized by T5. It sets the number of conditioning rows and their token anchors. |
-| `qwen_prefix` | STRING (multiline) | no | `""` | Prepended to `qwen_input` with exactly one space, on the Qwen side only. |
-| `strip_prefix` | BOOLEAN | no | `true` | Remove the rows that belong to `qwen_prefix` from the source hidden states. |
-
-| Output | Type | Description |
-|---|---|---|
-| `conditioning` | CONDITIONING | Source hidden states in `cross_attn`, plus `t5xxl_ids` / `t5xxl_weights` in the entry's extra dict. Upstream `Anima.extra_conds` runs the adapter and zero-pads to 512 rows. |
-
-## Use cases
-
-### 1. Decoupled source and target
-
-Give Qwen a full natural-language description and give T5 a clean tag string, or
-the other way around. The two sides are independent: the number of conditioning
-rows is decided by `t5_input` alone, so Qwen text never inflates the row count.
-
-### 2. Repeat the prompt — `PP【P】`
-
-Notation used below: `P` is your prompt, and `PP【P】` means "encode `P` three
-times and keep only the third copy as conditioning rows":
-
-```
-qwen_prefix  = P P      <- two copies, stripped away
-qwen_input   = P        <- the copy that survives
-t5_input     = <your usual tag string>
-strip_prefix = true
-```
-
-The node joins them into `P P P`, encodes that once, and cuts the first two
-copies' rows by token-level longest common prefix. The retained copy has
-attended to both earlier copies through Qwen's causal attention, so it carries a
-near-bidirectional view of the text — while the conditioning row count stays
-exactly the same as a single pass.
-
-Why not simply put `P P P` in `qwen_input`? Because then all three copies stay
-visible to the adapter, including the first one that never saw the rest of the
-text. Measured on a single Anima checkpoint at the conditioning-vector level,
-keeping only the last copy moves the conditioning **2.8–3.8×** further than
-leaving all three copies in, and the direction is cleaner (the "all copies
-visible" variant mixes in a nearly orthogonal key-duplication effect). See
-[Mechanism notes](docs/mechanism.md) for the numbers.
-
-Repeat counts beyond three keep helping, but with sharply diminishing returns:
-the third copy already reaches roughly 86–92% of the sixth copy's effect. Two
-copies capture more than half.
-
-> These are conditioning-level measurements, not image-quality results. They
-> show the mechanism is real and where it saturates; whether your images get
-> better is something to A/B on your own prompts.
-
-### 3. A prefix that never becomes a drawable row
-
-With `strip_prefix` on, `qwen_prefix` influences every following source row
-through attention but contributes no conditioning row of its own. That is the
-right place for house style, aspect hints or boilerplate: text placed directly
-in `t5_input` is what the DiT reads, and meta-text there has been observed to
-show up as visible text in the picture.
-
-### 4. Control the row budget
-
-The number of live conditioning rows equals the T5 token count of `t5_input`
-(upstream zero-pads to 512). Putting structure, comments or metadata on the
-Qwen side keeps `t5_input` short and its real-row : zero-row ratio high.
-
-## How `strip_prefix` works
-
-1. `source_text = qwen_prefix.strip() + " " + qwen_input.lstrip()` (unchanged
-   when the prefix is empty).
-2. `source_text` and `qwen_prefix` are both tokenized with the Qwen tokenizer.
-3. The dropped row count is the **measured** longest common prefix of the two
-   token-id sequences — not `len(tokenize(prefix))`, because whitespace merging
-   at the join point can shift the count by one.
-4. Those leading rows are sliced off `cond[:, dropped:]` before the adapter runs.
-
-If the prefix shares no token prefix with the joined text, the node raises an
-error instead of silently keeping prefix rows.
-
 ## Compatibility
 
 - Built for Anima (Cosmos-Predict2 style DiT + Qwen3-0.6B source + T5 target).
-- Requires a ComfyUI build with Anima support: upstream `>= 0.11.0` (the release
-  that shipped `comfy/text_encoders/anima.py`). Developed against `0.37.0`.
-- The node class key is `AnimaDecoupledConditioning`, so workflows saved against
-  earlier releases that used the same class name keep resolving.
+- Requires a ComfyUI build with Anima support: upstream `>= 0.11.0` (the release that
+  shipped `comfy/text_encoders/anima.py`). Developed against `0.37.0`.
+- The node class key stays `AnimaDecoupledConditioning`.
 
 ## Development
 
