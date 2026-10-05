@@ -1,25 +1,29 @@
 # ComfyUI Anima Decoupled Conditioning
 
-This extension provides the `Anima Decoupled Conditioning` node. It splits Anima's
-two text towers — the **Qwen3-0.6B source encoder** and the **T5 target tokenizer** —
-so each can receive its own text, which lets the model make better use of your prompt.
+This node separates Anima's two text towers — the **Qwen3-0.6B source encoder** and the
+**T5 target tokenizer** — into two independent inputs, so each can receive its own text:
+narrative and structure on the Qwen side, drawable content on the T5 side. This raises
+the amount of prompt information the model can act on.
 
 [中文说明](README.zh-CN.md) · [Usage guide](docs/usage.md) · [Mechanism notes](docs/mechanism.md)
 
 ## The node
 
-Use it exactly like a positive `CLIPTextEncode`: connect the Anima checkpoint's CLIP
-output to `clip`, connect `conditioning` to the sampler's positive input, and leave the
-negative path as it is.
+The node replaces the positive text-encoding node of an existing workflow. Take the CLIP
+output of the Anima checkpoint and connect it to the `clip` input; connect the
+`conditioning` output to the sampler's positive conditioning input. The negative
+conditioning path is left unchanged.
 
-| | Name | Type | Default | Description |
+| Direction | Name | Type | Default | Description |
 |---|---|---|---|---|
-| in | `clip` | CLIP | — | CLIP output of an Anima checkpoint (required; it provides the Qwen + T5 tokenizers). |
-| in | `qwen_input` | STRING | `""` | Body of the text handed to Qwen3-0.6B. |
-| in | `t5_input` | STRING | `""` | Text handed to T5; **decides the conditioning row count and each row's token anchor**. |
-| in | `qwen_prefix` | STRING | `""` | Prepended to `qwen_input` on the Qwen side only, with exactly one space. |
-| in | `strip_prefix` | BOOLEAN | `true` | Whether to cut the prefix's own rows from the source hidden states. |
-| out | `conditioning` | CONDITIONING | — | Upstream `Anima.extra_conds` runs the adapter and zero-pads to 512 rows. |
+| input | `clip` | CLIP | — | Text encoder of an Anima checkpoint; supplies the Qwen and T5 tokenizers. |
+| input | `qwen_input` | STRING | `""` | Body of the text sent to the Qwen3-0.6B encoder. |
+| input | `t5_input` | STRING | `""` | Text sent to the T5 tokenizer. **Determines the conditioning row count and each row's token anchor.** |
+| input | `qwen_prefix` | STRING | `""` | Joined to the front of `qwen_input` with a single space; enters the Qwen side only. |
+| input | `strip_prefix` | BOOLEAN | `true` | Whether to cut the rows occupied by the prefix from the source hidden states. |
+| output | `conditioning` | CONDITIONING | — | Positive conditioning for the sampler. The adapter forward pass and padding to 512 rows are performed by upstream `Anima.extra_conds`. |
+
+Data flow:
 
 ```mermaid
 flowchart LR
@@ -33,53 +37,58 @@ flowchart LR
 
 ## Use cases
 
-### 1. Repeat the prompt — `PP【P】`
+### 1. Prompt repetition — `PP【P】`
 
-Start here. It takes almost no change to an existing workflow: copy your prompt twice
-into `qwen_prefix` and leave every connection and parameter as it was.
+Notation: `P` is the prompt; `PP【P】` means the prompt is encoded three times and only the
+third copy is kept as conditioning rows.
 
-Notation: `P` is your prompt; `PP【P】` means "encode `P` three times, keep only the
-third copy as conditioning rows".
+The form can be added to an existing workflow without changing any other connection or
+parameter: supply the repeated prompt in `qwen_prefix`.
 
 ```
-qwen_prefix  = P P      <- two copies, stripped away
-qwen_input   = P        <- the copy that survives
-t5_input     = <your usual prompt>
+qwen_prefix  = P P      # two copies, cut after encoding
+qwen_input   = P        # the copy that is kept
+t5_input     = <original prompt>
 strip_prefix = true
 ```
 
-The node joins them into `P P P`, encodes that once, and cuts the first two copies'
-rows by token-level longest common prefix. Qwen attention is causal, so the surviving
-third copy has seen the first two (measured backflow 0.118; the first copy is exactly
-0), which gives the small model a roughly bidirectional view — while the **conditioning
-row count stays identical to a single pass** and the T5 side is untouched.
+The node joins the three copies into `P P P`, encodes the result once, and cuts the rows
+occupied by the first two copies by token-level longest common prefix. Qwen uses causal
+attention, so every token of the third copy can attend to the first two (measured
+backflow 0.118; the first copy measures exactly 0 as the causal control). The retained
+copy therefore carries an approximately bidirectional encoding of the prompt — at
+0.6B scale this compensates for the model's limited context window per token.
+**The conditioning row count is identical to the single-pass form, and the T5 side is
+unaffected.**
 
-Gains fall off quickly: the third copy already reaches ~86–92% of the sixth copy's
-effect, and the second copy gets more than half. Three copies is the recommended start.
+The gain decays quickly with repetition count: the third copy reaches about 86–92% of the
+sixth copy's effect, and the second copy already exceeds half. Three copies is the
+recommended starting point.
 
-Do not put the three copies directly into `qwen_input`: the un-contextualized first copy
-then stays among the adapter's keys, and the measured shift is only about a third of
-this recipe's, mixed with a nearly orthogonal key-duplication effect. See
-[mechanism notes](docs/mechanism.md).
+Writing the three copies directly into `qwen_input` is an alternative form with the same
+intent, but the first copy then remains in the adapter's key set without having been
+contextualized. The measured displacement for that form is about one third of the form
+above, and it mixes in a nearly orthogonal key-duplication effect; it is therefore not
+the recommended form. See [mechanism notes](docs/mechanism.md).
 
-> **Two measured caveats**
->
-> - **It changes the art style.** A different source shifts the overall direction of the
->   conditioning, so artist/style mixing can differ from what you get without it. Compare
->   at a fixed seed before switching.
-> - **Natural language shows more than pure tags.** When `t5_input` is a pure tag string,
->   the Qwen channel has little leverage on the final conditioning (measured at roughly
->   the 9% level for a pure-tag target), so the repeated source may barely show. It is
->   worth trying when the source is natural-language description.
+Measured caveats:
+
+- **Style shift.** A change on the source side changes the overall direction of the
+  conditioning, so artist and style mixing can differ from the result without the node.
+  Compare at a fixed seed before switching.
+- **Pure-tag prompts are insensitive.** When `t5_input` is a pure tag string, the Qwen
+  channel contributes little to the final conditioning (measured at roughly the 9% level
+  for a pure-tag target), so the source-side change may not reach the image. The form is
+  more applicable when the source is natural-language description.
 
 ### 2. Standard tags on T5, natural-language scene description on Qwen
 
-The row count comes from the T5 tokenization, and row content is what the DiT actually
-reads. Putting structure, relationships and narrative on the Qwen side attaches nearly
-unlimited context capacity through a channel that **costs no conditioning rows**.
+The conditioning row count is determined by the T5 tokenization, and row content is what
+the DiT reads. Placing structure, relationships and narrative on the Qwen side carries
+context capacity on a channel that consumes no conditioning rows.
 
-A reproducible example (`qwen_prefix` empty, `strip_prefix` left on; only the other two
-fields change):
+Reproducible example (`qwen_prefix` empty, `strip_prefix` left enabled; only the other two
+fields are set):
 
 ```
 qwen_input = A courier leans on a rusted railing above a flooded street; neon signs
@@ -89,57 +98,58 @@ t5_input   = 1girl, solo, courier jacket, rain, puddle, neon sign, railing, nigh
              from side, shallow depth of field, (backlight:1.2)
 ```
 
-- Write what you want drawn into `t5_input`, as complete phrases: the DiT's
-  cross-attention has no mask and no RoPE, so conditioning rows are an unordered set and
-  binding can only ride on the row content itself.
-- Put prose, structure markers and comments on the Qwen side. In testing, meta-text
-  (for example a literal `@handle`) placed in the target side was rendered as visible
-  text in the image.
-- This channel has less leverage than the T5 side: it is good for disambiguation and
-  steering, not for overriding what `t5_input` says.
+- Content to be drawn belongs in `t5_input`, expressed as complete phrases: the DiT's
+  cross-attention applies no mask and no RoPE, so conditioning rows are an unordered set
+  and binding is carried only by row content.
+- Prose, structure markers and comments belong on the Qwen side. In measurement, meta-text
+  placed on the target side (a literal such as `@handle`) was rendered as visible text in
+  the image.
+- This channel has less leverage than the T5 side. It is applicable to disambiguation and
+  steering, not to overriding the content of `t5_input`.
 
 ## How it works
 
 ### Why the split is possible
 
-Upstream `AnimaTokenizer` just tokenizes **one** text twice (Qwen vocabulary and T5
-vocabulary) and sends both into the same conditioning path; nothing in the code requires
-the two to come from the same text:
+Upstream `AnimaTokenizer` tokenizes one text twice — once with the Qwen vocabulary and
+once with the T5 vocabulary — and sends both results into the same conditioning path.
+Nothing in the code requires the two sides to originate from the same text:
 
-- `LLMAdapter(source_hidden_states, target_input_ids)` takes two independent inputs, and
-  the row count is decided entirely by the target (T5) side;
-- the adapter aligns the Qwen hidden states into the T5 conditioning space. It is a
-  separate component, completed before DiT training, and the DiT only consumes the
-  adapter's output without caring where either side came from — so changing the source
-  text needs no DiT change;
-- the node therefore only produces two things: source hidden states in `cross_attn`, and
-  the target side's `t5xxl_ids` / `t5xxl_weights`. Upstream `Anima.extra_conds` runs the
-  adapter and zero-pads to 512 rows.
+- `LLMAdapter(source_hidden_states, target_input_ids)` takes two independent inputs; the
+  row count is determined entirely by the target (T5) side;
+- the adapter aligns the Qwen hidden states into the T5 conditioning space. It is
+  separate from the DiT and is completed before DiT training; the DiT consumes only the
+  adapter's output and does not distinguish where either side came from, so replacing the
+  source text requires no DiT change;
+- the node therefore produces two items only: source hidden states written to
+  `cross_attn`, and the target side written to `t5xxl_ids` and `t5xxl_weights`. The
+  adapter forward pass and padding to 512 rows are performed by upstream
+  `Anima.extra_conds`.
 
-### Why repetition helps
+### Why repetition is effective
 
-Qwen3-0.6B is a small causal model: in a single pass over `A B C`, `A` cannot see `B` or
-`C`. Encoded as `A1 B1 C1 A2 B2 C2`, every token of the second copy can attend to the
-first copy — later content flows back into earlier positions. Measured: changing only the
-last tag from `flower` to `sword` moves the shared-prefix hidden states of the second
-copy by 0.118, while the two different edits produce directions with cosine 0.27 — the
-backflow carries specific content, not a generic "some preceding text exists" drift.
-Keeping only the last copy as conditioning rows yields a roughly bidirectional view at
-an unchanged row count.
+Qwen3-0.6B is small and uses causal attention: in a single pass over `A B C`, `A` cannot
+attend to `B` or `C`. Encoded as `A1 B1 C1 A2 B2 C2`, every token of the second copy can
+attend to the first copy, so later content flows back into earlier positions. Measured:
+changing only the final tag from `flower` to `sword` displaces the shared-prefix hidden
+states of the second copy by 0.118, and the two different edits produce directions with a
+cosine of 0.27 — the backflow carries specific content, not a generic drift. Keeping only
+the final copy as conditioning rows yields an approximately bidirectional encoding at an
+unchanged row count.
 
-### What `strip_prefix` does
+### `strip_prefix` processing
 
-1. `source_text = qwen_prefix.strip() + " " + qwen_input.lstrip()` (the body alone when
-   the prefix is empty).
-2. `source_text` and the prefix are tokenized separately with the Qwen tokenizer.
-3. The dropped row count is the **measured** longest common prefix of the two token-id
-   sequences — not `len(tokenize(prefix))`, because whitespace merging at the join point
-   can shift the count by one.
-4. Those leading rows are sliced off (`cond[:, dropped:]`) before the adapter runs: the
-   prefix still influences later rows through attention without occupying a row itself.
+1. Join as `source_text = qwen_prefix.strip() + " " + qwen_input.lstrip()`; when the
+   prefix is empty, `qwen_input` is used directly.
+2. Tokenize `source_text` and the prefix separately with the Qwen tokenizer.
+3. The number of rows cut is the measured length of the longest common prefix of the two
+   token-id sequences, not `len(tokenize(prefix))`: whitespace merging at the join point
+   changes the token count by one.
+4. Those leading rows are cut (`cond[:, dropped:]`) before the adapter runs. The prefix
+   still influences later rows through attention, but occupies no conditioning row.
 
-If the prefix shares no token prefix with the joined text, the node raises instead of
-silently keeping prefix rows.
+If the prefix shares no token prefix with the joined text, the node raises an error rather
+than silently retaining the prefix rows.
 
 ## Installation
 
@@ -150,24 +160,24 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/XiaoLinXiaoZhu/comfyui-anima-decoupled.git
 ```
 
-Then restart ComfyUI.
+Restart ComfyUI afterwards.
 
 ### Option 2 — ComfyUI Manager
 
-Choose **Install via Git URL** and paste:
+In ComfyUI Manager, choose **Install via Git URL** and paste:
 
 ```
 https://github.com/XiaoLinXiaoZhu/comfyui-anima-decoupled.git
 ```
 
-No Python dependencies beyond what ComfyUI already ships (`torch`).
+No dependencies beyond the `torch` shipped with ComfyUI.
 
 ## Compatibility
 
 - Built for Anima (Cosmos-Predict2 style DiT + Qwen3-0.6B source + T5 target).
-- Requires a ComfyUI build with Anima support: upstream `>= 0.11.0` (the release that
-  shipped `comfy/text_encoders/anima.py`). Developed against `0.37.0`.
-- The node class key stays `AnimaDecoupledConditioning`.
+- Requires a ComfyUI build with Anima support: upstream `>= 0.11.0`, the first release
+  containing `comfy/text_encoders/anima.py`. Developed against `0.37.0`.
+- The node class key remains `AnimaDecoupledConditioning`.
 
 ## Development
 
@@ -175,7 +185,7 @@ No Python dependencies beyond what ComfyUI already ships (`torch`).
 python tests/test_anima_decoupled.py
 ```
 
-The tests use a CLIP stand-in, so they run without a model or a GPU.
+The tests use a CLIP stand-in and require neither a model nor a GPU.
 
 ## License
 

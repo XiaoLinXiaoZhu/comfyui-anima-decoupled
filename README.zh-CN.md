@@ -1,23 +1,27 @@
 # ComfyUI Anima Decoupled Conditioning（Anima 解耦条件）
 
-本扩展提供 `Anima Decoupled Conditioning` 节点，把 Anima 的两个文本塔拆开——**Qwen3-0.6B source
-编码器**与 **T5 target 分词器**——使它们可以分别接收不同的文本，从而提高模型对提示词的理解能力。
+本节点将 Anima 的两个文本塔——**Qwen3-0.6B source 编码器**与 **T5 target 分词器**——拆分为两个
+独立输入，使两侧可以分别接收不同的文本：Qwen 侧承载叙述与结构，T5 侧承载需要绘制的内容，从而
+提升模型对提示词的理解能力。
 
 [English](README.md) · [使用文档](docs/usage.md) · [机制说明](docs/mechanism.md)
 
 ## 节点
 
-直接当作正向的 `CLIPTextEncode` 使用：`clip` 接 Anima checkpoint 的 CLIP 输出，`conditioning`
-接采样器的正向输入，负向按原样保留。
+本节点替代工作流中原有的正面文本编码节点。从 Anima checkpoint 的文本编码器取出 CLIP 输出，接入
+本节点的 `clip` 输入；将本节点的 `conditioning` 输出接入采样器的正面条件输入。负面条件维持原有
+接线不变。
 
-| | 名称 | 类型 | 默认 | 说明 |
+| 方向 | 名称 | 类型 | 默认 | 说明 |
 |---|---|---|---|---|
-| 输入 | `clip` | CLIP | — | Anima checkpoint 的 CLIP 输出（必需，它提供 Qwen + T5 双分词器）。 |
-| 输入 | `qwen_input` | STRING | `""` | 交给 Qwen3-0.6B 的正文。 |
-| 输入 | `t5_input` | STRING | `""` | 交给 T5 的文本；**决定条件行数与每行的 token 锚**。 |
-| 输入 | `qwen_prefix` | STRING | `""` | 只拼到 Qwen 侧 `qwen_input` 前面，中间恰好一个空格。 |
-| 输入 | `strip_prefix` | BOOLEAN | `true` | 是否从 source 隐状态里切掉前缀对应的行。 |
-| 输出 | `conditioning` | CONDITIONING | — | 上游 `Anima.extra_conds` 会跑 adapter 并零补齐到 512 行。 |
+| 输入 | `clip` | CLIP | — | 取自 Anima checkpoint 的文本编码器；提供 Qwen 与 T5 双分词器。 |
+| 输入 | `qwen_input` | STRING | `""` | 送入 Qwen3-0.6B 编码器的正文。 |
+| 输入 | `t5_input` | STRING | `""` | 送入 T5 分词器的文本。**决定条件行数与每行的 token 锚。** |
+| 输入 | `qwen_prefix` | STRING | `""` | 以单个空格拼接在 `qwen_input` 之前，仅进入 Qwen 侧。 |
+| 输入 | `strip_prefix` | BOOLEAN | `true` | 是否从 source 隐状态中切去前缀所占的行。 |
+| 输出 | `conditioning` | CONDITIONING | — | 送入采样器的正面条件。adapter 前向与补齐至 512 行由上游 `Anima.extra_conds` 执行。 |
+
+数据流：
 
 ```mermaid
 flowchart LR
@@ -31,43 +35,44 @@ flowchart LR
 
 ## 经典用例
 
-### 1. 提示词重复多遍 —— `PP【P】`
+### 1. 提示词重复 —— `PP【P】`
 
-优先推荐这一个：它对现有工作流几乎零改动，把原来的提示词原样复制两遍填进 `qwen_prefix`，
-其余连线和参数都不动。
+记法：`P` 为提示词；`PP【P】` 表示将 `P` 编码三遍，仅保留第三遍作为条件行。
 
-记号：`P` 是你的提示词；`PP【P】` 表示把 `P` 编码三遍，只保留第三遍作为条件行。
+该用法可直接接入既有工作流：在 `qwen_prefix` 中提供重复的提示词，其余接线与参数不变。
 
 ```
-qwen_prefix  = P P      <- 两遍，会被切掉
-qwen_input   = P        <- 保留下来的那一遍
-t5_input     = <你原本的提示词>
+qwen_prefix  = P P      # 两遍，编码后切去
+qwen_input   = P        # 保留的那一遍
+t5_input     = <原提示词>
 strip_prefix = true
 ```
 
-节点把它拼成 `P P P` 编码一次，再按 token 级最长公共前缀切掉前两遍的行。Qwen 是因果注意力，
-保留下来的第三遍因此看得到前两遍的内容（实测后文回流 0.118，第一遍严格为 0），相当于给小模型
-补了一次近似双向的编码；**条件行数与单遍完全一致**，T5 侧不受影响。
+节点将三份拼接为 `P P P` 后编码一次，再按 token 级最长公共前缀切去前两遍所占的行。Qwen 采用
+因果注意力，第三遍的每个 token 因此可以注意到前两遍的内容（实测后文回流 0.118，第一遍对照严格
+为 0），相当于为 0.6B 规模的模型补足一次近似双向的编码。**条件行数与单遍写法一致，T5 侧不受
+影响。**
 
-收益快速递减：第三遍已达第六遍效果的约 86–92%，第二遍就拿到一半以上。三遍是推荐起点。
+收益随重复次数快速衰减：第三遍达到第六遍效果的约 86–92%，第二遍已超过一半。建议自三遍起用。
 
-不要直接把三遍塞进 `qwen_input`：那样没被上下文化的第一遍也留在 adapter 的 key 里，实测位移只
-有本用法的 1/3 左右，且混入了近乎正交的 key 复制效应。见[机制说明](docs/mechanism.md)。
+将三份提示词直接写入 `qwen_input` 是等价目的的替代写法，但未经过上下文化的第一遍会保留在
+adapter 的 key 集合中。实测该写法的位移仅为上述用法的约三分之一，并混入近乎正交的 key 复制
+效应，故不作为推荐写法。详见[机制说明](docs/mechanism.md)。
 
-> **两点实测注意**
->
-> - **会改变画风**：source 侧的变化会改变条件的整体朝向，画师与风格的混合结果可能与原来不同。
->   换用前先固定 seed 对比。
-> - **自然语言比纯 tag 明显**：T5 侧是纯 tag 串时，Qwen 通道对最终条件的杠杆很小（实测该通道在
->   纯 tag target 下约占 9% 量级），重复带来的 source 变化可能几乎看不出来；source 用自然语言
->   叙述时更值得试。
+实测注意：
 
-### 2. T5 侧放标准 tag，Qwen 侧放自然语言画面描述
+- **画风偏移**：source 侧的改变会改变条件的整体朝向，画师与风格的混合结果可能与未启用时不同。
+  换用前应固定随机种子做对照。
+- **纯 tag 提示词不敏感**：当 `t5_input` 为纯 tag 串时，Qwen 通道对最终条件的贡献很小（实测该
+  通道在纯 tag target 下约占 9% 量级），重复引起的 source 变化可能不足以反映到画面；source 为
+  自然语言叙述时更值得采用。
 
-条件行数由 T5 分词长度决定，行内容才是 DiT 实际读到的东西。把不直接绘制的结构、关系和叙述放进
-Qwen 侧，等于给一个**不占用行预算**的通道接上几乎无上限的上下文容量。
+### 2. T5 侧提供标准 tag，Qwen 侧提供自然语言画面描述
 
-可复现示例（`qwen_prefix` 留空、`strip_prefix` 保持开启，只填另外两项）：
+条件行数由 T5 分词长度决定，行内容才是 DiT 实际读取的对象。将不直接绘制的结构、关系与叙述放入
+Qwen 侧，相当于在不占用行预算的通道上承载上下文容量。
+
+可复现示例（`qwen_prefix` 留空，`strip_prefix` 保持开启，仅填写另外两项）：
 
 ```
 qwen_input = A courier leans on a rusted railing above a flooded street; neon signs
@@ -77,44 +82,45 @@ t5_input   = 1girl, solo, courier jacket, rain, puddle, neon sign, railing, nigh
              from side, shallow depth of field, (backlight:1.2)
 ```
 
-- 想画出来的东西写进 `t5_input`，用完整短语表达归属：DiT 的 cross-attention 无 mask 也无 RoPE，
-  条件行是无序集合，绑定只能靠行内容本身携带。
-- 叙述、结构标记、注释放 Qwen 侧。实测把元文本（例如 `@handle` 这类字面量）放进 target 侧时，
-  它会被画成画面里的可见文字。
-- 这条通道的杠杆小于 T5 侧，适合消歧与引导，不适合覆盖 T5 写出的内容。
+- 需要绘制的内容写入 `t5_input`，并以完整短语表达归属关系：DiT 的 cross-attention 不施加 mask
+  与 RoPE，条件行是无序集合，绑定关系只能由行内容承载。
+- 叙述、结构标记与注释放入 Qwen 侧。实测将元文本（例如 `@handle` 这类字面量）置于 target 侧
+  时，会被渲染为画面中的可见文字。
+- 该通道的杠杆小于 T5 侧，适用于消歧与引导，不适用于覆盖 `t5_input` 的内容。
 
 ## 技术介绍
 
-### 为什么能拆分
+### 为什么可以拆分
 
-上游 `AnimaTokenizer` 只是把**同一段文本**分词两次（Qwen 词表与 T5 词表各一次），两份结果一起
-进同一条条件通路；代码上并没有约束两侧必须来自同一段文本：
+上游 `AnimaTokenizer` 对同一段文本分词两次（Qwen 词表与 T5 词表各一次），并将两份结果送入同一条
+条件通路。代码层面没有约束两侧必须来自同一段文本：
 
 - `LLMAdapter(source_hidden_states, target_input_ids)` 的两个入口互不依赖，条件行数完全由
   target（T5 token）侧决定；
-- adapter 负责把 Qwen 的隐状态对齐进 T5 条件空间。它是与 DiT 分开的独立组件（在 DiT 训练之前
-  完成），DiT 只消费 adapter 的输出、不区分两侧来源，因此更换 source 文本不需要改 DiT；
-- 于是节点只需要产出两样东西：source 侧隐状态放进 `cross_attn`，target 侧放进 `t5xxl_ids` /
-  `t5xxl_weights`。adapter 与零补齐到 512 行都由上游 `Anima.extra_conds` 完成。
+- adapter 负责将 Qwen 隐状态对齐到 T5 条件空间。它与 DiT 相互独立，在 DiT 训练之前完成，DiT
+  只消费 adapter 的输出、不区分两侧来源，因此更换 source 文本不需要修改 DiT；
+- 节点因此只需产出两项：source 侧隐状态写入 `cross_attn`，target 侧写入 `t5xxl_ids` 与
+  `t5xxl_weights`。adapter 前向与补齐至 512 行由上游 `Anima.extra_conds` 完成。
 
-### 为什么重复能提升
+### 为什么重复有效
 
-Qwen3-0.6B 是一个小的因果模型：单遍 `A B C` 里，`A` 看不到 `B`、`C`。编码成
-`A1 B1 C1 A2 B2 C2` 后，第二个副本的每个 token 都能注意到第一个副本，「后文信息回流到更早的
-位置」。实测把最后一个 tag 由 `flower` 改为 `sword`，第二副本公共前缀 token 的隐状态变化为
-0.118，而两种改动引起的 Δ 方向余弦只有 0.27——回流带的是具体内容，不是「前面多了一段东西」的
-通用漂移。只保留最后一副本作为条件行，就得到一次近似双向的编码，而行数不变。
+Qwen3-0.6B 规模小且采用因果注意力：单遍编码 `A B C` 时，`A` 无法注意到 `B` 与 `C`。编码为
+`A1 B1 C1 A2 B2 C2` 后，第二个副本的每个 token 都能注意到第一个副本，后文信息由此回流到更早的
+位置。实测：仅将最后一个 tag 由 `flower` 改为 `sword`，第二副本公共前缀 token 的隐状态位移为
+0.118；两种改动的 Δ 方向余弦为 0.27，说明回流携带的是具体内容，而非通用漂移。仅保留最后一个
+副本作为条件行，即可在不改变行数的前提下取得近似双向的编码。
 
-### `strip_prefix` 如何处理
+### `strip_prefix` 的处理流程
 
-1. `source_text = qwen_prefix.strip() + " " + qwen_input.lstrip()`（前缀为空时原样返回正文）。
-2. 用 Qwen 分词器分别对 `source_text` 与前缀分词。
-3. 切掉的行数取两条 token id 序列的**实测**最长公共前缀长度，而不是 `len(tokenize(prefix))`
-   ——拼接处的空白合并会让 token 数差 1。
-4. 在 adapter 之前按 `cond[:, dropped:]` 切掉这些行：前缀仍通过注意力影响后续行，但不自己
-   占条件行。
+1. 按 `source_text = qwen_prefix.strip() + " " + qwen_input.lstrip()` 拼接；前缀为空时直接使用
+   `qwen_input`。
+2. 分别使用 Qwen 分词器对 `source_text` 与前缀分词。
+3. 切去的行数取两条 token id 序列最长公共前缀的实测长度，而非 `len(tokenize(prefix))`：拼接处
+   的空白合并会使 token 数相差 1。
+4. 在进入 adapter 之前按 `cond[:, dropped:]` 切去这些行。前缀仍通过注意力影响后续行，但不占用
+   条件行。
 
-前缀与拼接文本没有公共 token 前缀时，节点直接报错，而不是悄悄保留前缀行。
+前缀与拼接文本不存在公共 token 前缀时，节点抛出错误，不会静默保留前缀行。
 
 ## 安装
 
@@ -125,23 +131,23 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/XiaoLinXiaoZhu/comfyui-anima-decoupled.git
 ```
 
-然后重启 ComfyUI。
+随后重启 ComfyUI。
 
 ### 方式二 —— ComfyUI Manager
 
-在 ComfyUI Manager 里选择 **Install via Git URL**，粘贴：
+在 ComfyUI Manager 中选择 **Install via Git URL**，粘贴：
 
 ```
 https://github.com/XiaoLinXiaoZhu/comfyui-anima-decoupled.git
 ```
 
-除 ComfyUI 自带的 `torch` 外没有额外依赖。
+除 ComfyUI 自带的 `torch` 外无额外依赖。
 
 ## 兼容性
 
 - 面向 Anima（Cosmos-Predict2 风格 DiT + Qwen3-0.6B source + T5 target）。
-- 需要带 Anima 支持的上游 ComfyUI：`>= 0.11.0`（首个包含 `comfy/text_encoders/anima.py`
-  的版本）。开发环境为 `0.37.0`。
+- 需要带 Anima 支持的上游 ComfyUI：`>= 0.11.0`（首个包含 `comfy/text_encoders/anima.py` 的
+  版本）。开发环境为 `0.37.0`。
 - 节点类名保持 `AnimaDecoupledConditioning`。
 
 ## 开发
