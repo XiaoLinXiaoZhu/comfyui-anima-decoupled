@@ -104,8 +104,9 @@ t5_input   = 1girl, solo, courier jacket, rain, puddle, neon sign, railing, nigh
 - Prose, structure markers and comments belong on the Qwen side. In measurement, meta-text
   placed on the target side (a literal such as `@handle`) was rendered as visible text in
   the image.
-- This channel has less leverage than the T5 side. It is applicable to disambiguation and
-  steering, not to overriding the content of `t5_input`.
+- This channel has less influence on the final conditioning than the T5 side. It is
+  applicable to disambiguation and steering, not to overriding the content of
+  `t5_input`.
 
 ## How it works
 

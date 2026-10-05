@@ -67,9 +67,9 @@ side, where it consumes no conditioning rows.
 Two properties of the Qwen channel constrain its use:
 
 - Meta-text placed in `t5_input` was observed to be rendered as visible text in the image.
-- The Qwen channel has less leverage than the T5 side (roughly the 9% level for a pure-tag
-  target in measurement). It is applicable to disambiguation and steering; it cannot be
-  expected to override the content of `t5_input`.
+- The Qwen channel has less influence on the final conditioning than the T5 side (roughly
+  the 9% level for a pure-tag target in measurement). It is applicable to disambiguation
+  and steering; it cannot be expected to override the content of `t5_input`.
 
 ## 2. Wiring
 
@@ -98,8 +98,8 @@ rejected with an error that names Anima.
 - Disable prompt randomization and wildcard nodes for the duration of the comparison.
 - After reaching a verdict, change the seed and confirm the verdict holds; per-seed
   variation can exceed the effect under test.
-- Record the exact widget values alongside each image. Output from `PP【P】` is otherwise
-  easy to attribute to the wrong string.
+- Record the exact widget values alongside each image. Otherwise, output from `PP【P】` may
+  be attributed to the wrong string.
 
 ## 4. Troubleshooting
 

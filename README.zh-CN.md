@@ -86,8 +86,8 @@ t5_input   = 1girl, solo, courier jacket, rain, puddle, neon sign, railing, nigh
 - 需要绘制的内容写入 `t5_input`，并以完整短语表达归属关系：DiT 的 cross-attention 不施加 mask
   与 RoPE，条件行是无序集合，绑定关系只能由行内容承载。
 - 叙述、结构标记与注释放入 Qwen 侧。实测将元文本（例如 `@handle` 这类字面量）置于 target 侧
-  时，会被渲染为画面中的可见文字。
-- 该通道的杠杆小于 T5 侧，适用于消歧与引导，不适用于覆盖 `t5_input` 的内容。
+  时，该文本会被渲染为画面中的可见文字。
+- 该通道对最终条件的影响小于 T5 侧，适用于消歧与引导，不适用于覆盖 `t5_input` 的内容。
 
 ## 技术介绍
 
