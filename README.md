@@ -43,7 +43,7 @@ Notation: `P` is the prompt; `PP【P】` means the prompt is encoded three times
 third copy is kept as conditioning rows.
 
 The form can be added to an existing workflow without changing any other connection or
-parameter: supply the repeated prompt in `qwen_prefix`.
+parameter: the prompt is supplied twice in `qwen_prefix` and once in `qwen_input`.
 
 ```
 qwen_prefix  = P P      # two copies, cut after encoding
